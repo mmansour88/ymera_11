@@ -1,29 +1,32 @@
 
-import os, time
+from datetime import datetime
+from decimal import Decimal
 from sqlalchemy.orm import Session
-from .models import Budget
 
-COST_HINT = {
-    "openai": 0.002,      # very rough per-call default
-    "anthropic": 0.003,
-    "groq": 0.0005,
-    "deepseek": 0.0002,
-    "gemini": 0.0003,
-}
+def month_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m")
 
-def _today_key():
-    return time.strftime("%Y-%m-%d")
+def add_usage(db: Session, org_id: int, usd: Decimal, tokens_in: int, tokens_out: int):
+    # ensure table exists (migration 0005 creates it)
+    db.execute(
+        "INSERT INTO usage_counters(org_id, month, usd, tokens_in, tokens_out) VALUES (:o,:m,:u,:ti,:to)",
+        {"o": org_id, "m": month_key(datetime.utcnow()), "u": float(usd), "ti": tokens_in, "to": tokens_out}
+    )
+    db.commit()
 
-# naive in-DB reset: if spent_today_usd > 0 and date changed, reset externally or via cron
-def check_and_increment(db: Session, provider: str, est_cost: float=None):
-    provider = provider.lower()
-    b = db.query(Budget).filter(Budget.provider==provider).first()
-    if not b:
-        b = Budget(provider=provider, daily_limit_usd=float(os.getenv("BUDGET_LIMIT_"+provider.upper(), 1.0)))
-        db.add(b); db.flush()
-    est = est_cost if est_cost is not None else COST_HINT.get(provider, 0.001)
-    if (b.spent_today_usd or 0) + est > (b.daily_limit_usd or 1.0):
-        return False, b
-    b.spent_today_usd = (b.spent_today_usd or 0) + est
-    db.add(b)
-    return True, b
+def current_usage(db: Session, org_id: int) -> float:
+    row = db.execute("SELECT COALESCE(SUM(usd),0) FROM usage_counters WHERE org_id=:o AND month=:m",
+                     {"o": org_id, "m": month_key(datetime.utcnow())}).fetchone()
+    return float(row[0] or 0.0)
+
+def budget_limit(db: Session, org_id: int) -> float:
+    row = db.execute("SELECT monthly_usd_limit FROM budgets WHERE org_id=:o", {"o": org_id}).fetchone()
+    return float(row[0]) if row else 0.0
+
+def enforce_budget(db: Session, org_id: int):
+    limit = budget_limit(db, org_id)
+    if limit <= 0:
+        return  # disabled
+    used = current_usage(db, org_id)
+    if used >= limit:
+        raise RuntimeError(f"Budget exceeded for org {org_id}: used ${used:.2f} / limit ${limit:.2f}")
